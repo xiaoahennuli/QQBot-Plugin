@@ -32,7 +32,7 @@ import {
 import { qrRegister, generateQRCode, BindStatus } from './Model/qr-auth.js'
 import { getMessageMeta } from './Model/eventMeta.js'
 import {
-  sendWithGroupMarkdownImageRetry,
+  sendWithMarkdownImageRetry,
   uploadRichMediaByParts,
   getQQApiErrorCode
 } from './lib/richMediaUpload.js'
@@ -46,6 +46,7 @@ import {
   cleanupMediaFiles,
   IMG_DIR
 } from './lib/media.js'
+import { prepareMarkdownImageBytes } from './lib/markdownImageBytes.js'
 import {
   installTokenRefreshRetry,
   installTokenWatchdog,
@@ -472,6 +473,85 @@ const _sdkVersion = await (async () => {
   }
   return 'QQBot'
 })()
+/**
+ * 图床/本地服务产出的 URL 全部是本项目自己生成的，属于「不可信来源」：
+ * 直接抓它们的字节会带来 SSRF 面。这里只允许真实落地的公网地址，
+ * 挡掉回环、私网、链路本地和云元数据地址。
+ */
+function isFetchableImageUrl (value) {
+  try {
+    const url = new URL(String(value))
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    if (!host) return false
+    if (host === 'localhost' || host.endsWith('.localhost')) return false
+    if (host.endsWith('.local') || host.endsWith('.lan') || host.endsWith('.internal')) return false
+    if (host === '::1' || host === '0.0.0.0') return false
+    if (/^127\./.test(host)) return false
+    if (/^10\./.test(host)) return false
+    if (/^192\.168\./.test(host)) return false
+    if (/^169\.254\./.test(host)) return false
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 从一段 markdown/文本里取出所有图片地址（含重试时注入的临时 image_url 参数） */
+function extractImageUrlsFromText (text) {
+  const urls = []
+  const push = value => {
+    if (!value) return
+    let url = value
+    try {
+      const parsed = new URL(value)
+      parsed.searchParams.delete('image_url')
+      url = parsed.toString()
+    } catch { }
+    if (isFetchableImageUrl(url) && !urls.includes(url)) urls.push(url)
+  }
+  const re = /!\[[^\]]*\]\(\s*([^)\s]+)[^)]*\)|\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s)"']+)/g
+  let match
+  while ((match = re.exec(text))) push(match[1] || match[2] || match[3])
+  return urls
+}
+
+/** 深拷贝，避免改坏调用方仍在使用的消息对象 */
+function cloneDeepPlain (value) {
+  if (Array.isArray(value)) return value.map(cloneDeepPlain)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneDeepPlain(item)]))
+  }
+  return value
+}
+
+/** 在所有字符串字段里做「整条 URL 替换」 */
+function replaceUrlsDeep (value, replacements) {
+  if (typeof value === 'string') {
+    let result = value
+    for (const [from, to] of replacements) result = result.split(from).join(to)
+    return result
+  }
+  if (Array.isArray(value)) return value.map(item => replaceUrlsDeep(item, replacements))
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceUrlsDeep(item, replacements)]))
+  }
+  return value
+}
+
+const IMG_BED_UPLOAD_TIMEOUT_MS = 15000
+
+/**
+ * Markdown 图片的最大边长（像素）。
+ *
+ * 平台的 markdown 图片是「服务端下载转存」，对体量比富媒体敏感得多：超出后返回
+ * 304010 CHANGE_IMAGE_URL（图片转存错误）。而 markdown 路径原先完全没有尺寸约束：
+ * 一张 1440x5439、11MB 的渲染卡片会原样交出去，转存必失败。
+ * 富媒体走的是上传字节，不受这条限制 —— 这就是「同一张图富媒体能发、markdown 裂」的原因。
+ */
+const IMG_BED_MARKDOWN_MAX_PX = 4096
+
 let sharp
 if (config.imageLength) {
   try {
@@ -599,7 +679,11 @@ const adapter = new class QQBotAdapter {
       })
       const json = await res.json()
       if (json.code === 0 && json.data?.image_url) return json.data.image_url
-    } catch { }
+      throw new Error(`B站返回异常: code=${json.code} message=${json.message || ''}`)
+    } catch (err) {
+      // 原先这里静默吞掉：图床挂了统计里只看到一个 fail，没有任何线索。
+      Bot.makeLog('warn', ['B站图床上传失败', err?.message || err], data.self_id)
+    }
   }
 
   async uploadToHuaban(data, buffer) {
@@ -623,7 +707,10 @@ const adapter = new class QQBotAdapter {
       })
       const json = await res.json()
       if (json.key) return `https://hbimg.huabanimg.com/${json.key}`
-    } catch { }
+      throw new Error(`花瓣返回异常: ${JSON.stringify(json).slice(0, 200)}`)
+    } catch (err) {
+      Bot.makeLog('warn', ['花瓣图床上传失败', err?.message || err], data.self_id)
+    }
   }
 
   async uploadToTelegraph(data, buffer) {
@@ -636,7 +723,8 @@ const adapter = new class QQBotAdapter {
 
     const form = new FormData()
     form.append('file', new Blob([buffer], { type: 'image/jpeg' }), 'image.jpg')
-    const res = await fetch(api, { method: 'POST', body: form })
+    // telegraph 在国内经常连不上，必须给超时，否则会一直挂到 socket 默认超时
+    const res = await fetch(api, { method: 'POST', body: form, signal: AbortSignal.timeout(15000) })
     const text = await res.text()
     if (!res.ok) throw new Error(`Telegraph上传失败: HTTP ${res.status} ${text.slice(0, 200)}`)
 
@@ -715,7 +803,10 @@ const adapter = new class QQBotAdapter {
         headers: { 'Content-Type': mime, 'Authorization': json.data.uploadAuthorization }
       })
       if (uploadRes.ok) return uploadUrl
-    } catch { }
+      throw new Error(`COS上传失败: HTTP ${uploadRes.status}`)
+    } catch (err) {
+      Bot.makeLog('warn', ['COS图床上传失败', err?.message || err], data.self_id)
+    }
   }
 
   async uploadToQQChannel(data, buffer) {
@@ -739,7 +830,10 @@ const adapter = new class QQBotAdapter {
         const md5 = crypto.createHash('md5').update(buffer).digest('hex').toUpperCase()
         return `https://gchat.qpic.cn/qmeetpic/0/0-0-${md5}/0`
       }
-    } catch { }
+      throw new Error(`QQ频道图床上传失败: HTTP ${res.status}`)
+    } catch (err) {
+      Bot.makeLog('warn', ['QQ频道图床上传失败', err?.message || err], data.self_id)
+    }
   }
 
   #detectImageExt(buffer) {
@@ -827,7 +921,16 @@ const adapter = new class QQBotAdapter {
       if (!enabled) continue
       const start = Date.now()
       try {
-        const url = await upload()
+        // 单层图床必须有超时：beds 是串行回退，telegra.ph 等站点在国内可能一直挂到
+        // socket 默认超时，把被动回复的 5 分钟窗口和 5 次机会全部吃光，消息发不出去。
+        const timeout = new Promise((_, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error(`图床上传超时(${IMG_BED_UPLOAD_TIMEOUT_MS}ms)`)),
+            IMG_BED_UPLOAD_TIMEOUT_MS
+          )
+          timer.unref?.()
+        })
+        const url = await Promise.race([upload(), timeout])
         if (statsEnabled) await recordStat({
           bed,
           name,
@@ -931,6 +1034,53 @@ const adapter = new class QQBotAdapter {
     }
   }
 
+  /**
+   * Markdown 图片被平台拒绝转存（304010 / 40034004）时的换床重试。
+   *
+   * 原先的重试只认 fileToUrl 产出的本地地址，而图床自己产出的地址不在那个 Map 里 ——
+   * 于是开了图床的用户一旦遇到转存失败，重试拿到 replaced: 0，就把同一张坏图原样
+   * 重发三次，必然全失败。这里改成：从消息里把候选图片地址抽出来，重新下载字节上传
+   * 到可用图床，成功一个就把整条 URL 替换掉。
+   *
+   * 只处理公网地址（isFetchableImageUrl 挡掉内网），避免把重试变成 SSRF。
+   */
+  async switchMarkdownImagesToImageBed (data, message) {
+    const payload = cloneDeepPlain(message)
+    const text = JSON.stringify(payload)
+    if (!text) return { message, replaced: 0, urls: [] }
+
+    // 候选来源：消息里出现的、公网可达的图片地址
+    const candidates = extractImageUrlsFromText(text)
+    const pending = candidates.filter(url => text.includes(url))
+    if (!pending.length) return { message, replaced: 0, urls: [] }
+
+    const replacements = new Map()
+    let lastError = null
+    for (const url of pending) {
+      try {
+        const buffer = await Bot.Buffer(url, { http: true, signal: AbortSignal.timeout(15000) })
+        if (!Buffer.isBuffer(buffer) || !buffer.length) throw new Error('下载到的图片为空')
+        const imageBedUrl = await this.uploadToImageBed(data, buffer)
+        if (imageBedUrl && !String(imageBedUrl).startsWith(String(url))) {
+          replacements.set(url, String(imageBedUrl))
+        }
+      } catch (err) {
+        lastError = err
+      }
+    }
+
+    if (!replacements.size) {
+      if (lastError) logger.warn(`[QQBot] Markdown 图片换床失败: ${lastError?.message || lastError}`)
+      return { message, replaced: 0, urls: [] }
+    }
+
+    return {
+      message: replaceUrlsDeep(payload, replacements),
+      replaced: replacements.size,
+      urls: [...replacements.values()]
+    }
+  }
+
   async makeMarkdownImage(data, file, summary = '图片') {
     const imageData = !Buffer.isBuffer(file) && file && typeof file === 'object' ? file : {}
     const imageMeta = imageData.data && typeof imageData.data === 'object' ? imageData.data : imageData
@@ -945,17 +1095,39 @@ const adapter = new class QQBotAdapter {
       image = { url: externalUrl }
     } else {
       buffer = await resolveImageSizeInput(source) ?? await Bot.Buffer(source)
-      image = {}
-      try {
-        localUrl = getExternalImageUrl(await Bot.fileToUrl(source))
-        if (localUrl) {
-          image.url = localUrl
+      // markdown 图片原先完全没有体量约束：一张渲染出来的长卡片（实测 1440x5439 / 11MB）
+      // 会原样交给本地服务、图床和平台，而平台的 markdown 图片是服务端下载转存，超出后
+      // 直接 304010 图片转存错误 —— 富媒体走上传字节所以不受影响，这就是两者表现不同的原因。
+      //
+      // 这里不再复用 compressImage：它按 `imageLength` 阈值降质，对这张 11MB 的卡片只会降到
+      // q85 约 2.4MB —— 体积下来了，5439px 的边长一点没动，平台照样拒。markdown 路径需要的是
+      // 先限边长再降质。
+      const prepped = await this.#prepareMarkdownImageBytes(data, buffer)
+      if (prepped?.buffer) {
+        buffer = prepped.buffer
+        // 有公网图床地址就直接用，不再绕本地服务 —— 转存要的就是公网可达。
+        if (prepped.url) {
+          image = { url: prepped.url }
           this.rememberLocalMarkdownImageUrl(image.url, data.self_id)
+        } else if (prepped.file) {
+          // 没上传成功（例如图床全挂）：把压缩后的字节落成本地文件，让 fileToUrl 拿到
+          // 压缩后的真实字节，而不是压缩前那张 11MB 的原图。
+          source = prepped.file
         }
-      } catch (err) {
-        Bot.makeLog('debug', ['本地图片服务转换失败', source, err], data.self_id)
       }
-      if (!image.url) image = await this.makeBotImage(buffer) || {}
+      if (!image) {
+        image = {}
+        try {
+          localUrl = getExternalImageUrl(await Bot.fileToUrl(source))
+          if (localUrl) {
+            image.url = localUrl
+            this.rememberLocalMarkdownImageUrl(image.url, data.self_id)
+          }
+        } catch (err) {
+          Bot.makeLog('debug', ['本地图片服务转换失败', source, err], data.self_id)
+        }
+        if (!image.url) image = await this.makeBotImage(buffer) || {}
+      }
     }
     image.width = Number(imageMeta.width) || null
     image.height = Number(imageMeta.height) || null
@@ -1020,11 +1192,10 @@ const adapter = new class QQBotAdapter {
       const imgBedUrl = await this.uploadToImageBed(data, buffer)
       if (imgBedUrl) {
         image.url = imgBedUrl
-      } else if (!image.url) {
-        // 图床全挂、而且自己也没有任何可用 URL —— 这时才用 default 占位图兜底。
-        // 不能无条件用占位图：否则 server.url（如 https://bot.kevcore.cn）拼出的
-        // /File/xxx 这种本来就能正常加载的公网地址会被顶掉，
-        // 用户收到的就是占位图而不是真正的内容图。
+      } else {
+        // 能走到这里说明 shouldUploadToImageBed 已判定当前 image.url 不是公网可达地址
+        // （localhost / 内网，或压根没有 URL），图床又全部失败 —— 此时必须用 default 兜底。
+        // 原先的条件 `else if (!image.url)` 会留下内网地址：QQ 拉不到，用户看到裂图。
         const defaultImageUrl = String(config.imgBed?.default || '').trim()
         if (defaultImageUrl) {
           image.url = defaultImageUrl
@@ -1623,6 +1794,62 @@ const adapter = new class QQBotAdapter {
       Bot.makeLog('error', ['图片压缩错误', err], data.self_id)
       return file
     }
+  }
+
+  /**
+   * 为 markdown 图片准备一份「平台转得动」的字节，并尽量直接换成公网图床地址。
+   *
+   * 解决两个叠加的问题：
+   *   1. markdown 图片原先没有体量约束，超长/超大图会被平台以 304010（图片转存错误）拒掉；
+   *   2. 图床产出的地址过去不会被复用，还得再绕一圈本地服务，而本地服务往往不是公网可达
+   *      （markdownImgScale / server.url 没配好时就是 localhost），转存同样失败。
+   *
+   * 流程：限边长 → 降质到 imageLength 以内 → 上传图床拿公网地址。
+   * 上传失败时把压缩后的字节落成本地文件返回（file），调用方据此让 fileToUrl 拿到压缩后的
+   * 真实字节，而不是压缩前那张原图。
+   *
+   * @returns {Promise<{buffer?: Buffer, url?: string, file?: string}|null>}
+   */
+  async #prepareMarkdownImageBytes (data, buffer) {
+    if (!Buffer.isBuffer(buffer) || !buffer.length) return null
+    if (!sharp) {
+      Bot.makeLog('debug', ['sharp 不可用，markdown 图片跳过尺寸处理'], data.self_id)
+      return null
+    }
+
+    const imageLength = Number(config.imageLength)
+    const prepped = await prepareMarkdownImageBytes({
+      buffer,
+      sharp,
+      maxPx: IMG_BED_MARKDOWN_MAX_PX,
+      maxBytes: Number.isFinite(imageLength) && imageLength > 0 ? imageLength * 1024 * 1024 : 0
+    })
+    // null = 尺寸体积都合规（或预处理失败），交给原有链路处理
+    if (!prepped) return null
+
+    Bot.makeLog('info', ['markdown 图片已缩放以适配平台转存', {
+      before: `${buffer.length} B`,
+      before_side: '见原图',
+      after: `${prepped.buffer.length} B`,
+      after_side: prepped.reason
+    }], data.self_id)
+
+    // 优先直接给公网图床地址：markdown 转存要的就是公网可达，少绕一层本地服务
+    try {
+      const url = await this.uploadToImageBed(data, prepped.buffer)
+      if (url) return { buffer: prepped.buffer, url: String(url) }
+    } catch (err) {
+      Bot.makeLog('warn', ['markdown 缩放后上传图床失败', err?.message || err], data.self_id)
+    }
+
+    // 图床没接住：落成本地文件，保证 fileToUrl 拿到的是缩放后的字节而不是原图
+    try {
+      const file = await Bot.fileToUrl(prepped.buffer)
+      if (file) return { buffer: prepped.buffer, file: String(file) }
+    } catch (err) {
+      Bot.makeLog('debug', ['markdown 缩放结果落盘失败', err?.message || err], data.self_id)
+    }
+    return { buffer: prepped.buffer }
   }
 
   async makeMsg(data, msg) {
@@ -4588,22 +4815,22 @@ const adapter = new class QQBotAdapter {
         const sdkOptions = { ...options }
         delete sdkOptions.__qqbot
 
-        const sendCurrentMessage = () => sendWithGroupMarkdownImageRetry({
+        const sendCurrentMessage = () => sendWithMarkdownImageRetry({
           endpointPath,
           messagePayload: buildResult.messagePayload,
           send: () => originalMessageSendRegularMessage(endpointPath, buildResult, sdkOptions),
           onRetry: async ({ code, attempt, delayMs }) => {
-            const fallback = await adapterInstance.switchLocalMarkdownImagesToImageBed(
+            const fallback = await adapterInstance.switchMarkdownImagesToImageBed(
               { self_id: id, bot: Bot[id] },
               buildResult.messagePayload
             )
             if (!fallback.replaced) {
-              logger.warn(`[QQBot] 群聊 Markdown 图片转存失败(code(${code}))，${delayMs}ms 后进行第 ${attempt} 次重试`)
+              logger.warn(`[QQBot] Markdown 图片换床失败(code(${code}))，${delayMs}ms 后进行第 ${attempt} 次重试`)
               return false
             }
             buildResult.messagePayload = fallback.message
             applyPayloadOptions(buildResult, options)
-            logger.info(`[QQBot] 本地图片被平台拒绝(code(${code}))，已自动切换图床并重发: ${fallback.urls.join(', ')}`)
+            logger.info(`[QQBot] Markdown 图片被平台拒绝转存(code(${code}))，已切换图床并重发: ${fallback.urls.join(', ')}`)
             return true
           }
         })
